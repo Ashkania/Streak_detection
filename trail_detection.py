@@ -20,6 +20,7 @@ from astropy.io import fits
 from astropy.visualization import ZScaleInterval, AsinhStretch
 import json
 import argparse
+import h5py
 
 
 def parse_args():
@@ -32,6 +33,13 @@ def parse_args():
         type=str,
         help="Path to the FITS file to process"
         )
+    
+    parser.add_argument(
+        '--dr',
+        type=str,
+        help="Path to the fistar DR file for star masking (optional)"
+        )
+    
     return parser.parse_args()
 
 
@@ -215,7 +223,9 @@ def detect_streaks_hough(edge_img, original_uint8, config=None):
     return lines
 
 
-############# ADDED #######################
+# ─────────────────────────────────────────────────────────────
+# Merge collinear Hough segments into cleaner detections
+# ─────────────────────────────────────────────────────────────
 
 def merge_collinear_segments(lines, angle_tol=3.0, dist_tol=30.0):
     """
@@ -383,7 +393,6 @@ def measure_streak_profile(img, detection, n_samples=10):
     return np.mean(widths) if widths else 0.0
 
 
-
 def classify_detections(img, lines, min_length=50):
     """
     Given raw HoughLinesP output, classify each line as:
@@ -453,6 +462,77 @@ def classify_detections(img, lines, min_length=50):
 
     return detections
 
+
+def build_star_mask_from_dr(dr_path, img_shape, psf_scale=2.0):
+    """
+    Build a star mask from fistar extractions using circular masks.
+    Radius per star = s * psf_scale, where s is the Gaussian sigma.
+
+    psf_scale=2.0 ≈ 1 FWHM. Raise to 3.0 for safety margin.
+    """
+
+    mask = np.zeros(img_shape, dtype=np.uint8)
+
+    with h5py.File(dr_path, 'r') as f:
+        base = '/SourceExtraction/Version000/Sources'
+        xs = f[f'{base}/x'][:]
+        ys = f[f'{base}/y'][:]
+        ss = f[f'{base}/s'][:]
+
+    print(f"[+] fistar sources: {len(xs)}")
+    print(f"[+] s range: {ss.min():.2f} – {ss.max():.2f}  mean={ss.mean():.2f}")
+
+    for x, y, s in zip(xs, ys, ss):
+        radius = max(3, int(round(s * psf_scale)))
+        cv2.circle(mask, (int(round(x)), int(round(y))), radius, 255, -1)
+
+    masked_fraction = np.sum(mask > 0) / mask.size
+    print(f"[+] Mask coverage: {masked_fraction*100:.1f}% of image")
+
+    return mask.astype(bool)
+
+
+def filter_by_star_overlap(detections, star_mask, overlap_threshold=0.85):
+    """
+    Reject detections where most pixels along the line land on stars.
+    
+    overlap_threshold=0.85 means: if 85% or more of the sampled
+    pixels along this line are within a star's PSF, reject it.
+    
+    Real trails pass through open sky between stars.
+    False positives from star halos/diffraction are almost entirely
+    within star PSF regions.
+    """
+    kept = []
+    for d in detections:
+        x1, y1, x2, y2 = d['x1'], d['y1'], d['x2'], d['y2']
+        
+        # Sample ~200 points along the line
+        n_samples = min(200, int(d['length']))
+        xs = np.linspace(x1, x2, n_samples).astype(int)
+        ys = np.linspace(y1, y2, n_samples).astype(int)
+        
+        # Clip to image bounds
+        valid = ((xs >= 0) & (xs < star_mask.shape[1]) &
+                 (ys >= 0) & (ys < star_mask.shape[0]))
+        xs, ys = xs[valid], ys[valid]
+        
+        if len(xs) == 0:
+            continue
+        
+        # What fraction of line pixels fall on a star?
+        on_star = np.sum(star_mask[ys, xs])
+        overlap = on_star / len(xs)
+        d['star_overlap'] = float(overlap)
+        
+        if overlap >= overlap_threshold:
+            print(f"  [rejected] {d['label']} {d['length']:.0f}px — "
+                  f"{overlap*100:.0f}% on stars")
+            continue
+        
+        kept.append(d)
+
+    return kept
 
 # ─────────────────────────────────────────────────────────────
 # Annotate and visualize results
@@ -650,6 +730,7 @@ if __name__ == "__main__":
 
     args = parse_args()
     fits_path = args.image
+    dr_path   = args.dr
 
     # ── Loading FITS...
     raw_data, uint8_img = load_and_stretch(fits_path)
@@ -697,6 +778,11 @@ if __name__ == "__main__":
         min_length=50
         )
     
+    mask = build_star_mask_from_dr(dr_path, img_shape=raw_data.shape, psf_scale=2.0) if dr_path else None
+    if mask is not None:
+        detections = filter_by_star_overlap(detections, mask, overlap_threshold=0.85)
+
+
     # for d in detections:
     #     print(f"      {d['label']:<12}  length={d['length']:.0f}px  angle={d['angle']:.1f}°")
 
