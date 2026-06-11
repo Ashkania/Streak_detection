@@ -62,7 +62,7 @@ def preprocess_for_streaks(uint8_img):
     Prepare the image so that streaks are maximally visible
     and stars/noise are suppressed before edge detection.
 
-    Returns dict of intermediate stages — study each one!
+    Returns dict of intermediate stages
     """
     stages = {}
     stages['input'] = uint8_img.copy()
@@ -129,31 +129,40 @@ def apply_canny(img, low_thresh=30, high_thresh=90):
 
 def explore_canny_thresholds(prepped_img):
     """Show how different Canny thresholds affect detection. Study this!"""
-    configs = [
-        (10,  30,  "Very sensitive (noisy)"),
-        (30,  90,  "Balanced (recommended)"),
-        (60,  180, "Conservative (misses faint)"),
-        (100, 300, "Very strict (only bright)"),
-    ]
 
     # ~ (250, 750)
-    configs_pan = [
-        (250,  750,  "Very sensitive (noisy)"),
-        (200,  750,  "Balanced (recommended)"),
-        (150,  750, "Conservative (misses faint)"),
-        (100, 750, "Very strict (only bright)"),
+    configs = [
+        (75,  150),
+        (75,  200),
+        (75,  250),
+        (75, 300),
+
+        (100,  200),
+        (100,  250),
+        (100,  350),
+        (100, 450),
+
+        (150,  300),
+        (150,  350),
+        (150,  450),
+        (150, 550),
+
+        (200,  300),
+        (200,  400),
+        (200,  500),
+        (200, 600)
     ]
 
-    fig, axes = plt.subplots(2, 2, figsize=(15, 9))
+    fig, axes = plt.subplots(2, 8, figsize=(30, 20))
     fig.suptitle('Canny Threshold Exploration\n'
                  'low:high ratio stays ~1:3 — only sensitivity changes',
                  fontsize=12, fontweight='bold')
 
-    for ax, (lo, hi, label) in zip(axes.flatten(), configs_pan):
+    for ax, (lo, hi) in zip(axes.flatten(), configs):
         edges = apply_canny(prepped_img, lo, hi)
         edge_px = np.sum(edges > 0)
         ax.imshow(edges, cmap='gray', origin='lower')
-        ax.set_title(f'{label}\nlow={lo}, high={hi}  |  edge pixels={edge_px}', fontsize=9)
+        ax.set_title(f'low={lo}, high={hi}  |  edge pixels={edge_px}', fontsize=9)
         ax.axis('off')
 
     plt.tight_layout()
@@ -409,6 +418,15 @@ def classify_detections(img, lines, min_length=50):
             'label':  'satellite',
         }
 
+        # detections.append({
+        #     'x1': int(x1), 'y1': int(y1),
+        #     'x2': int(x2), 'y2': int(y2),
+        #     'length': float(length),
+        #     'angle':  float(angle),
+        #     'mid_x':  float(mid_x),
+        #     'mid_y':  float(mid_y),
+        #     'label':  'satellite',      # default, may be updated below
+        # })
 
         profile_width = measure_streak_profile(img, d)
         d['profile_width'] = profile_width
@@ -418,15 +436,7 @@ def classify_detections(img, lines, min_length=50):
         if profile_width < 3.0:
             continue   # reject as detector artifact
 
-        detections.append({
-            'x1': int(x1), 'y1': int(y1),
-            'x2': int(x2), 'y2': int(y2),
-            'length': float(length),
-            'angle':  float(angle),
-            'mid_x':  float(mid_x),
-            'mid_y':  float(mid_y),
-            'label':  'satellite',      # default, may be updated below
-        })
+        detections.append(d)
 
     # Check for Starlink groups
     if len(detections) >= 2:
@@ -487,14 +497,14 @@ def annotate_image(uint8_img, detections):
         text_y = int(d['mid_y']) - 8
 
         # Black background behind text for readability
-        (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+        (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 4, 10)
         cv2.rectangle(annotated,
                       (text_x - 2, text_y - th - 2),
                       (text_x + tw + 2, text_y + 2),
                       (0, 0, 0), -1)
         cv2.putText(annotated, label_text,
                     (text_x, text_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 4, color, 10, cv2.LINE_AA)
 
     return annotated
 
@@ -538,7 +548,7 @@ def plot_full_pipeline(stages, edge_img, detections, annotated_bgr, uint8_img):
     ax5.axis('off')
 
     # Final annotated result
-    ax6.imshow(cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB), origin='lower')
+    ax6.imshow(cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB), origin='upper')
     ax6.set_title('6. Final annotated result', fontsize=9)
     ax6.axis('off')
 
@@ -649,13 +659,13 @@ if __name__ == "__main__":
 
     # ── Explore Canny thresholds (educational) ──
     # Exploring Canny thresholds...
-    explore_canny_thresholds(stages['sharpened'])
+    # explore_canny_thresholds(stages['sharpened'])
 
     # ── Running Canny edge detector...
     edge_img = apply_canny(
         stages['sharpened'],
-        low_thresh=200,
-        high_thresh=600
+        low_thresh=100,
+        high_thresh=450
         )
     edge_pixels = np.sum(edge_img > 0)
     print(f"    Edge pixels found: {edge_pixels} ({100*edge_pixels/edge_img.size:.2f}% of image)")
@@ -663,10 +673,10 @@ if __name__ == "__main__":
     # ── Running Hough Line Transform...
     hough_config = {
         'rho':           1,
-        'theta':         np.pi / 180,
+        'theta':         np.pi / 360,
         'threshold':     70,   # minimum votes to accept a line
-        'minLineLength': 250,   # minimum length of line segments to report
-        'maxLineGap':    15,   # max gap to connect collinear segments into one line
+        'minLineLength': 200,   # minimum length of line segments to report
+        'maxLineGap':    12,   # max gap to connect collinear segments into one line
     }
     raw_lines = detect_streaks_hough(edge_img, uint8_img, hough_config)
 
