@@ -62,6 +62,41 @@ def load_and_stretch(filepath, hdu_index=1):
     return data, uint8
 
 
+def inpaint_stars(uint8_img, star_mask, method='median'):
+    """
+    Replace star pixels with local background to suppress
+    false edges from stars before Canny/Hough.
+
+    method:
+      'median'  — fast, replaces with global background median
+      'inpaint' — slower, uses OpenCV inpainting for smoother results
+                  (better near bright/large stars)
+    """
+    if method == 'median':
+        # Background = median of non-star pixels
+        background_level = np.median(uint8_img[~star_mask])
+
+        cleaned = uint8_img.copy()
+        cleaned[star_mask] = background_level
+
+        # Add a touch of noise so the patched regions don't look
+        # unnaturally flat to Canny (flat regions are fine, but
+        # matching the noise floor avoids a sharp mask-edge artifact)
+        noise = np.random.normal(0, 2, size=np.sum(star_mask)).astype(np.int16)
+        patched = cleaned[star_mask].astype(np.int16) + noise
+        cleaned[star_mask] = np.clip(patched, 0, 255).astype(np.uint8)
+
+        return cleaned
+
+    elif method == 'inpaint':
+        # OpenCV inpainting — fills masked regions using surrounding texture
+        # Slower but handles large saturated stars more naturally
+        mask_uint8 = (star_mask.astype(np.uint8)) * 255
+        cleaned = cv2.inpaint(uint8_img, mask_uint8,
+                              inpaintRadius=6,
+                              flags=cv2.INPAINT_TELEA)
+        return cleaned
+
 # ─────────────────────────────────────────────────────────────
 # Preprocessing pipeline for streak detection
 # ─────────────────────────────────────────────────────────────
@@ -477,8 +512,11 @@ def build_star_mask_from_dr(dr_path, img_shape, radius=4):
 
     with h5py.File(dr_path, 'r') as f:
         base = '/SourceExtraction/Version000/Sources'
+        base_catalog = 'ProjectedSources/Version000'
         xs = f[f'{base}/x'][:]
         ys = f[f'{base}/y'][:]
+        xcat = f[f'{base_catalog}/x'][:]
+        ycat = f[f'{base_catalog}/y'][:]
         # ss = f[f'{base}/s'][:]
 
     print(f"[+] fistar sources: {len(xs)}")
@@ -488,10 +526,13 @@ def build_star_mask_from_dr(dr_path, img_shape, radius=4):
         # radius = max(3, int(round(s * psf_scale)))
         cv2.circle(mask, (int(round(x)), int(round(y))), radius, 255, -1)
 
+    # for xc, yc in zip(xcat, ycat):
+    #     cv2.circle(mask, (int(round(xc)), int(round(yc))), radius -1, 255, -1)
+
     masked_fraction = np.sum(mask > 0) / mask.size
     print(f"[+] Mask coverage: {masked_fraction*100:.1f}% of image")
 
-    return mask.astype(bool), zip(xs, ys)
+    return mask.astype(bool)
 
 
 def filter_by_star_overlap(detections, star_mask, overlap_threshold=0.85):
@@ -693,7 +734,7 @@ def plot_detection_stats(detections):
 # Detection report (JSON output for later pipeline)
 # ─────────────────────────────────────────────────────────────
 
-def save_detection_report(detections, fits_path, output_path="detections.json"):
+def save_detection_report(detections, fits_path, output_path="Results/detections.json"):
     """
     Save detections as JSON — lays the groundwork for Module 6's
     full pipeline where you'll process folders of FITS files.
@@ -724,7 +765,7 @@ def save_detection_report(detections, fits_path, output_path="detections.json"):
     return report
 
 
-def save_ds9_regions(detections, star_positions, output_path='region.reg', coord_system='image'):
+def save_ds9_regions(detections, output_path='Results/region.reg', coord_system='image'):
     """
     Save detections as a DS9 region file.
     
@@ -757,11 +798,11 @@ def save_ds9_regions(detections, star_positions, output_path='region.reg', coord
                 f'{d["angle"]:.1f}deg}}\n'
             )
         
-        for x, y in star_positions:
-            f.write(
-                f'circle({x+1},{y+1},4) '
-                f'# color=red width=1\n'
-            )
+        # for x, y in star_positions:
+        #     f.write(
+        #         f'circle({x+1},{y+1},7) '
+        #         f'# color=red width=1\n'
+        #     )
 
 
     print(f"[+] Saved {len(detections)} regions → {output_path}")
@@ -778,6 +819,10 @@ if __name__ == "__main__":
 
     # ── Loading FITS...
     raw_data, uint8_img = load_and_stretch(fits_path)
+
+    star_mask = build_star_mask_from_dr(dr_path, img_shape=raw_data.shape)
+
+    uint8_img = inpaint_stars(uint8_img, star_mask, method='inpaint')
 
     # ── Preprocessing...
     stages = preprocess_for_streaks(uint8_img)
@@ -822,16 +867,14 @@ if __name__ == "__main__":
         min_length=200
         )
     
-    mask, star_positions = build_star_mask_from_dr(dr_path, img_shape=raw_data.shape) if dr_path else (None, None)
     # sns.heatmap(mask.astype(float), cmap='gray', cbar=False)
 
-    if mask is not None:
-        detections = filter_by_star_overlap(detections, mask, overlap_threshold=0.85)
+    # if mask is not None:
+    #     detections = filter_by_star_overlap(detections, mask, overlap_threshold=0.85)
 
 
     save_ds9_regions(detections,
-                     star_positions,
-                     fits_path[fits_path.rfind("/") + 1:].replace(".fits.fz", ".reg")
+                     'Results/'+fits_path[fits_path.rfind("/") + 1:].replace(".fits.fz", ".reg")
                      )
     # for d in detections:
     #     print(f"      {d['label']:<12}  length={d['length']:.0f}px  angle={d['angle']:.1f}°")
