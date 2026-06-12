@@ -21,6 +21,7 @@ from astropy.visualization import ZScaleInterval, AsinhStretch
 import json
 import argparse
 import h5py
+import seaborn as sns
 
 
 def parse_args():
@@ -393,7 +394,7 @@ def measure_streak_profile(img, detection, n_samples=10):
     return np.mean(widths) if widths else 0.0
 
 
-def classify_detections(img, lines, min_length=50):
+def classify_detections(img, lines, min_length=200):
     """
     Given raw HoughLinesP output, classify each line as:
       - 'satellite'  : single long streak
@@ -414,6 +415,7 @@ def classify_detections(img, lines, min_length=50):
         x1, y1, x2, y2 = line[0]
         length, angle, mid_x, mid_y = compute_line_properties(x1, y1, x2, y2)
 
+        print(length)
         if length < min_length:
             continue   # too short → noise
 
@@ -463,7 +465,7 @@ def classify_detections(img, lines, min_length=50):
     return detections
 
 
-def build_star_mask_from_dr(dr_path, img_shape, psf_scale=2.0):
+def build_star_mask_from_dr(dr_path, img_shape, radius=4):
     """
     Build a star mask from fistar extractions using circular masks.
     Radius per star = s * psf_scale, where s is the Gaussian sigma.
@@ -477,19 +479,19 @@ def build_star_mask_from_dr(dr_path, img_shape, psf_scale=2.0):
         base = '/SourceExtraction/Version000/Sources'
         xs = f[f'{base}/x'][:]
         ys = f[f'{base}/y'][:]
-        ss = f[f'{base}/s'][:]
+        # ss = f[f'{base}/s'][:]
 
     print(f"[+] fistar sources: {len(xs)}")
-    print(f"[+] s range: {ss.min():.2f} – {ss.max():.2f}  mean={ss.mean():.2f}")
+    # print(f"[+] s range: {ss.min():.2f} – {ss.max():.2f}  mean={ss.mean():.2f}")
 
-    for x, y, s in zip(xs, ys, ss):
-        radius = max(3, int(round(s * psf_scale)))
+    for x, y in zip(xs, ys):
+        # radius = max(3, int(round(s * psf_scale)))
         cv2.circle(mask, (int(round(x)), int(round(y))), radius, 255, -1)
 
     masked_fraction = np.sum(mask > 0) / mask.size
     print(f"[+] Mask coverage: {masked_fraction*100:.1f}% of image")
 
-    return mask.astype(bool)
+    return mask.astype(bool), zip(xs, ys)
 
 
 def filter_by_star_overlap(detections, star_mask, overlap_threshold=0.85):
@@ -524,7 +526,7 @@ def filter_by_star_overlap(detections, star_mask, overlap_threshold=0.85):
         on_star = np.sum(star_mask[ys, xs])
         overlap = on_star / len(xs)
         d['star_overlap'] = float(overlap)
-        
+        print(f"  overlap={overlap:.2f}  label={d['label']}  length={d['length']:.0f}px")
         if overlap >= overlap_threshold:
             print(f"  [rejected] {d['label']} {d['length']:.0f}px — "
                   f"{overlap*100:.0f}% on stars")
@@ -722,6 +724,48 @@ def save_detection_report(detections, fits_path, output_path="detections.json"):
     return report
 
 
+def save_ds9_regions(detections, star_positions, output_path='region.reg', coord_system='image'):
+    """
+    Save detections as a DS9 region file.
+    
+    coord_system: 'image' — pixel coordinates (use if no WCS in your FITS)
+                  'fk5'   — RA/Dec (requires WCS, more work)
+    """
+    color_map = {
+        'satellite': 'green',
+        'starlink':  'cyan',
+        'airplane':  'red',
+    }
+
+    with open(output_path, 'w') as f:
+        # Header
+        f.write('# Region file format: DS9 version 4.1\n')
+        f.write(f'global color=green width=2 font="helvetica 10 normal" '
+                f'select=1 highlite=1 dash=0 fixed=0 edit=1 move=1 delete=1\n')
+        f.write(f'{coord_system}\n')
+
+        for d in detections:
+            color  = color_map.get(d['label'], 'green')
+            x1, y1 = d['x1'], d['y1']
+            x2, y2 = d['x2'], d['y2']
+
+            # DS9 image coords are 1-indexed — add 1
+            f.write(
+                f'line({x1+1},{y1+1},{x2+1},{y2+1}) '
+                f'# color={color} width=2 '
+                f'text={{  {d["label"]} {d["length"]:.0f}px '
+                f'{d["angle"]:.1f}deg}}\n'
+            )
+        
+        for x, y in star_positions:
+            f.write(
+                f'circle({x+1},{y+1},4) '
+                f'# color=red width=1\n'
+            )
+
+
+    print(f"[+] Saved {len(detections)} regions → {output_path}")
+
 # ─────────────────────────────────────────────────────────────
 # MAIN — Run the full pipeline
 # ─────────────────────────────────────────────────────────────
@@ -755,8 +799,8 @@ if __name__ == "__main__":
     hough_config = {
         'rho':           1,
         'theta':         np.pi / 360,
-        'threshold':     70,   # minimum votes to accept a line
-        'minLineLength': 200,   # minimum length of line segments to report
+        'threshold':     10,   # minimum votes to accept a line
+        'minLineLength': 150,   # minimum length of line segments to report
         'maxLineGap':    12,   # max gap to connect collinear segments into one line
     }
     raw_lines = detect_streaks_hough(edge_img, uint8_img, hough_config)
@@ -775,20 +819,26 @@ if __name__ == "__main__":
     detections = classify_detections(
         uint8_img,
         raw_lines,
-        min_length=50
+        min_length=200
         )
     
-    mask = build_star_mask_from_dr(dr_path, img_shape=raw_data.shape, psf_scale=2.0) if dr_path else None
+    mask, star_positions = build_star_mask_from_dr(dr_path, img_shape=raw_data.shape) if dr_path else (None, None)
+    # sns.heatmap(mask.astype(float), cmap='gray', cbar=False)
+
     if mask is not None:
         detections = filter_by_star_overlap(detections, mask, overlap_threshold=0.85)
 
 
+    save_ds9_regions(detections,
+                     star_positions,
+                     fits_path[fits_path.rfind("/") + 1:].replace(".fits.fz", ".reg")
+                     )
     # for d in detections:
     #     print(f"      {d['label']:<12}  length={d['length']:.0f}px  angle={d['angle']:.1f}°")
 
 
     annotated_bgr = annotate_image(uint8_img, detections)
-    plot_full_pipeline(stages, edge_img, detections, annotated_bgr, uint8_img)
+    # plot_full_pipeline(stages, edge_img, detections, annotated_bgr, uint8_img)
     # plot_detection_stats(detections)
     report = save_detection_report(detections, fits_path)
 
